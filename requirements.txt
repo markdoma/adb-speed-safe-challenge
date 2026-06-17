@@ -1,0 +1,10 @@
+pandas>=2.0
+jupyterlab>=4.0
+ipykernel>=6.0
+
+# Optional geospatial/mapping packages for the notebook's next-step sections.
+# Uncomment as needed after the base notebook is running.
+# geopandas>=0.14
+# shapely>=2.0
+# folium>=0.16
+mapillary
