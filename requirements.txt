@@ -8,3 +8,8 @@ ipykernel>=6.0
 # shapely>=2.0
 # folium>=0.16
 mapillary
+
+# Computer-vision packages for Mapillary/thumbnail VRU context detection.
+ultralytics>=8.0
+opencv-python>=4.8
+Pillow>=10.0
