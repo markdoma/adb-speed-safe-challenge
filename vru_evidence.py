@@ -1,11 +1,8 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 import os
 import re
-import socket
-import time
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 import pandas as pd
 
@@ -44,6 +41,14 @@ VRU_BOOLEAN_COLUMNS = [
     "speed_sign_visible",
 ]
 
+MAPILLARY_EVIDENCE_COLUMNS = [
+    "mapillary_has_coverage",
+    "mapillary_image_count",
+    "mapillary_api_value_count",
+    "mapillary_api_values",
+    *VRU_BOOLEAN_COLUMNS,
+]
+
 DEFAULT_VRU_EXPOSURE_WEIGHTS = {
     "is_urban_land_use": 0.20,
     "road_class_vru_weight": 0.12,
@@ -58,13 +63,22 @@ DEFAULT_VRU_EXPOSURE_WEIGHTS = {
     "has_mapillary_evidence": 0.02,
 }
 
-CV_MODEL_LABEL_MAP = {
-    "sidewalk_present": {"sidewalk", "pavement"},
-    "crossing_present": {"crosswalk", "zebra crossing", "pedestrian crossing"},
-    "school_context": {"school", "school zone", "student", "children"},
-    "market_context": {"market", "shop", "store", "vendor", "stall"},
-    "transit_stop_context": {"bus stop", "bus", "train station", "station"},
-    "pedestrian_activity_visible": {"person", "pedestrian", "bicycle", "bicyclist", "motorcycle", "motorcyclist"},
+MAPILLARY_VALUE_KEYWORDS = {
+    "sidewalk_present": {"sidewalk", "pavement", "curb", "kerb"},
+    "crossing_present": {"crosswalk", "crossing", "zebra", "pedestrian-crossing", "pedestrians-crossing"},
+    "school_context": {"school", "children", "student"},
+    "market_context": {"market", "shop", "store", "vendor", "stall", "commercial"},
+    "transit_stop_context": {"bus-stop", "bus stop", "bus", "public-transport", "train", "station", "transit"},
+    "pedestrian_activity_visible": {
+        "human--person",
+        "person",
+        "pedestrian",
+        "bicyclist",
+        "motorcyclist",
+        "rider",
+        "bicycle",
+        "motorcycle",
+    },
 }
 
 
@@ -96,237 +110,129 @@ def setup_mapillary_client(project_root: Path):
     return mly
 
 
-def load_cv_model(model_name: str = "yolov8n.pt"):
-    """Load an optional Ultralytics YOLO model for image-based VRU context detection."""
-    try:
-        from ultralytics import YOLO
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Install `ultralytics` to run CV detection, for example `%pip install ultralytics`."
-        ) from exc
-    return YOLO(model_name)
+def bbox_around_point(lon: float, lat: float, radius_m: float) -> dict:
+    """Create a small WGS84 bbox around a lon/lat point."""
+    lat_delta = radius_m / 111_320
+    lon_delta = radius_m / (111_320 * max(0.1, abs(math.cos(math.radians(lat)))))
+    return {
+        "west": lon - lon_delta,
+        "south": lat - lat_delta,
+        "east": lon + lon_delta,
+        "north": lat + lat_delta,
+    }
 
 
-def detect_vru_context_with_cv(
-    image_path: str | Path,
-    model=None,
-    model_name: str = "yolov8n.pt",
-    confidence_threshold: float = 0.25,
-    label_map: dict[str, set[str]] | None = None,
-) -> dict:
-    """Detect VRU context labels from a local street image using an optional CV model.
+def records_from_mapillary_response(response) -> list[dict]:
+    """Normalize Mapillary API/SDK responses into a list of records."""
+    if response is None:
+        return []
+    if hasattr(response, "to_dict"):
+        response = response.to_dict()
+    if isinstance(response, str):
+        try:
+            import json
 
-    The default YOLO model is useful for visible road users such as people,
-    bicycles, motorcycles, buses, and traffic-adjacent objects. Specialized
-    models are recommended for sidewalks, crossings, schools, and markets.
-    """
-    label_map = label_map or CV_MODEL_LABEL_MAP
-    model = model or load_cv_model(model_name)
-    results = model(str(image_path))
+            response = json.loads(response)
+        except Exception:
+            return []
+    if isinstance(response, dict):
+        if isinstance(response.get("data"), list):
+            return response["data"]
+        if isinstance(response.get("features"), list):
+            records = []
+            for feature in response["features"]:
+                props = dict(feature.get("properties") or {})
+                props.setdefault("id", feature.get("id"))
+                props.setdefault("geometry", feature.get("geometry"))
+                records.append(props)
+            return records
+        return [response]
+    if isinstance(response, list):
+        return response
+    return []
 
-    detections = []
-    detected_labels = set()
-    for result in results:
-        names = getattr(result, "names", {}) or {}
-        boxes = getattr(result, "boxes", None)
-        if boxes is None:
+
+def classify_mapillary_values(values: list[str], keywords: dict[str, set[str]] = MAPILLARY_VALUE_KEYWORDS) -> dict:
+    """Classify Mapillary detection/map-feature values into VRU evidence flags."""
+    normalized_values = [str(value).lower() for value in values if pd.notna(value)]
+    joined = " | ".join(normalized_values)
+    out = {}
+    for field, field_keywords in keywords.items():
+        out[field] = int(any(keyword.lower() in joined for keyword in field_keywords))
+    out["mapillary_api_values"] = ";".join(sorted(set(normalized_values)))
+    out["mapillary_api_value_count"] = len(normalized_values)
+    return out
+
+
+def mapillary_values_from_records(records: list[dict]) -> list[str]:
+    values = []
+    for record in records:
+        if isinstance(record, dict):
+            value = record.get("value") or record.get("object_value") or record.get("class") or record.get("type")
+            if value is not None:
+                values.append(str(value))
+    return values
+
+
+def mapillary_feature_context(mly, lon: float, lat: float, radius_m: float = 100) -> dict:
+    """Use Mapillary map-feature and traffic-sign API values as VRU context evidence."""
+    if mly is None or pd.isna(lon) or pd.isna(lat):
+        return {}
+
+    bbox = bbox_around_point(float(lon), float(lat), radius_m)
+    values = []
+    errors = []
+    calls = [
+        ("map_points", getattr(mly, "map_feature_points_in_bbox", None)),
+        ("traffic_signs", getattr(mly, "traffic_signs_in_bbox", None)),
+    ]
+    for label, func in calls:
+        if func is None:
             continue
-        for box in boxes:
-            confidence = float(box.conf[0]) if getattr(box, "conf", None) is not None else 0.0
-            if confidence < confidence_threshold:
-                continue
-            class_id = int(box.cls[0]) if getattr(box, "cls", None) is not None else None
-            label = str(names.get(class_id, class_id)).lower()
-            detected_labels.add(label)
-            detections.append({"label": label, "confidence": confidence})
+        try:
+            values.extend(mapillary_values_from_records(records_from_mapillary_response(func(bbox=bbox))))
+        except Exception as exc:
+            errors.append(f"{label}:{exc}")
 
-    context = {field: 0 for field in label_map}
-    for field, labels in label_map.items():
-        context[field] = int(bool(detected_labels.intersection({label.lower() for label in labels})))
-    context["cv_detected_labels"] = ";".join(sorted(detected_labels))
-    context["cv_detection_count"] = len(detections)
-    context["cv_detections"] = detections
+    context = classify_mapillary_values(values)
+    context["mapillary_feature_error"] = "; ".join(errors) if errors else pd.NA
     return context
 
 
-def apply_cv_context_to_evidence(
-    evidence: pd.DataFrame,
-    image_path_col: str = "local_image_path",
-    model=None,
-    model_name: str = "yolov8n.pt",
-    confidence_threshold: float = 0.25,
-) -> pd.DataFrame:
-    """Populate VRU evidence columns from local images when optional CV packages are installed."""
-    if image_path_col not in evidence.columns:
-        raise ValueError(f"Evidence must include `{image_path_col}` with local image paths.")
-
-    out = evidence.copy()
-    model = model or load_cv_model(model_name)
-    for idx, row in out.iterrows():
-        image_path = row.get(image_path_col)
-        if pd.isna(image_path) or not Path(image_path).exists():
-            continue
-        context = detect_vru_context_with_cv(
-            image_path,
-            model=model,
-            confidence_threshold=confidence_threshold,
-        )
-        for col, value in context.items():
-            if col == "cv_detections":
-                continue
-            if col in CV_MODEL_LABEL_MAP and col in out.columns and pd.notna(out.loc[idx, col]):
-                if value:
-                    out.loc[idx, col] = value
-                continue
-            out.loc[idx, col] = value
-    return out
-
-
-def validate_download_url(url: str) -> tuple[bool, str]:
-    """Return whether a URL is usable for thumbnail download plus a reason."""
-    parsed = urlparse(str(url).strip())
-    if parsed.scheme not in {"http", "https"}:
-        return False, "invalid_url_scheme"
-    if not parsed.netloc:
-        return False, "missing_url_host"
-    return True, parsed.netloc
-
-
-def host_resolves(host: str) -> bool:
+def mapillary_detection_context_for_image(mly, image_id) -> dict:
+    """Use Mapillary image detection API values as VRU context evidence."""
+    if mly is None or pd.isna(image_id):
+        return {}
     try:
-        socket.getaddrinfo(host, None)
-    except OSError:
-        return False
-    return True
+        normalized_id = int(float(str(image_id)))
+        records = records_from_mapillary_response(mly.get_detections_with_image_id(image_id=normalized_id, fields=["value"]))
+        return classify_mapillary_values(mapillary_values_from_records(records))
+    except Exception as exc:
+        return {"mapillary_detection_error": str(exc)}
 
 
-def download_file(url: str, output_path: Path, timeout_seconds: int = 30, retries: int = 1) -> Path:
-    """Download one URL to a local file using the Python standard library."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    request = Request(url, headers={"User-Agent": "safe-speed-vru-evidence/1.0"})
-    last_error = None
-    for attempt in range(retries + 1):
-        try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                output_path.write_bytes(response.read())
-            return output_path
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            last_error = exc
-            if attempt < retries:
-                time.sleep(1)
-    raise last_error
-
-
-def download_evidence_thumbnails(
-    evidence: pd.DataFrame,
-    image_dir: Path,
-    url_col: str = "mapillary_thumbnail_url",
-    id_col: str = "mapillary_image_id",
-    output_col: str = "local_image_path",
-    limit: int | None = None,
-    retry_failed_downloads: bool = False,
-    timeout_seconds: int = 30,
-    retries: int = 1,
-) -> pd.DataFrame:
-    """Download Mapillary thumbnail URLs in an evidence table and add local image paths."""
-    out = evidence.copy()
-    if url_col not in out.columns:
-        raise ValueError(f"Evidence must include `{url_col}`.")
-
-    image_dir.mkdir(parents=True, exist_ok=True)
-    rows = out.head(limit).iterrows() if limit else out.iterrows()
-    unavailable_hosts = set()
-    attempted = downloaded = skipped = failed = 0
-    for idx, row in rows:
-        existing_path = row.get(output_col) if output_col in out.columns else None
-        if pd.notna(existing_path) and str(existing_path).strip() and Path(str(existing_path)).exists():
-            skipped += 1
-            continue
-
-        existing_error = row.get("thumbnail_download_error") if "thumbnail_download_error" in out.columns else None
-        if not retry_failed_downloads and pd.notna(existing_error) and str(existing_error).strip():
-            skipped += 1
-            continue
-
-        url = row.get(url_col)
-        if pd.isna(url) or not str(url).strip():
-            skipped += 1
-            continue
-        attempted += 1
-
-        valid_url, host_or_reason = validate_download_url(str(url))
-        if not valid_url:
-            out.loc[idx, "thumbnail_download_error"] = host_or_reason
-            failed += 1
-            continue
-
-        host = host_or_reason
-        if host in unavailable_hosts:
-            out.loc[idx, "thumbnail_download_error"] = f"host_unavailable:{host}"
-            skipped += 1
-            continue
-        if not host_resolves(host):
-            unavailable_hosts.add(host)
-            out.loc[idx, "thumbnail_download_error"] = f"dns_unavailable:{host}"
-            failed += 1
-            continue
-
-        image_id = row.get(id_col) if id_col in out.columns else idx
-        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(image_id or idx)).strip("_")
-        image_path = image_dir / f"{safe_id or idx}.jpg"
-
-        if not image_path.exists():
-            try:
-                download_file(str(url), image_path, timeout_seconds=timeout_seconds, retries=retries)
-            except Exception as exc:
-                if isinstance(exc, URLError) and "nodename nor servname" in str(exc):
-                    unavailable_hosts.add(host)
-                out.loc[idx, "thumbnail_download_error"] = str(exc)
-                failed += 1
-                continue
-
-        out.loc[idx, output_col] = str(image_path)
-        out.loc[idx, "thumbnail_download_error"] = pd.NA
-        downloaded += 1
-
-    out.attrs["thumbnail_download_summary"] = {
-        "attempted": attempted,
-        "downloaded": downloaded,
-        "skipped": skipped,
-        "failed": failed,
-        "unavailable_hosts": sorted(unavailable_hosts),
-    }
-    return out
-
-
-def run_yolo_on_evidence_cache(
-    evidence_path: Path,
-    image_dir: Path,
-    model_name: str = "yolov8n.pt",
-    confidence_threshold: float = 0.25,
-    limit: int | None = None,
-    retry_failed_downloads: bool = False,
-) -> pd.DataFrame:
-    """Download Mapillary thumbnails, run YOLO context detection, and update the cache CSV."""
-    if not evidence_path.exists():
-        raise FileNotFoundError(f"Evidence cache does not exist: {evidence_path}")
-
-    evidence = pd.read_csv(evidence_path)
-    evidence = download_evidence_thumbnails(
-        evidence,
-        image_dir=image_dir,
-        limit=limit,
-        retry_failed_downloads=retry_failed_downloads,
-    )
-    download_summary = evidence.attrs.get("thumbnail_download_summary", {})
-    evidence = apply_cv_context_to_evidence(
-        evidence,
-        model_name=model_name,
-        confidence_threshold=confidence_threshold,
-    )
-    evidence.attrs["thumbnail_download_summary"] = download_summary
-    evidence.to_csv(evidence_path, index=False)
-    return evidence
+def merge_mapillary_contexts(*contexts: dict) -> dict:
+    """Merge multiple Mapillary-derived context dictionaries into one evidence row."""
+    merged = {}
+    value_sets = []
+    errors = []
+    for context in contexts:
+        for key, value in (context or {}).items():
+            if key in VRU_BOOLEAN_COLUMNS:
+                merged[key] = max(float(merged.get(key, 0) or 0), float(value or 0))
+            elif key == "mapillary_api_values" and pd.notna(value):
+                value_sets.extend(str(value).split(";"))
+            elif key.endswith("_error") and pd.notna(value):
+                errors.append(f"{key}:{value}")
+            elif key == "mapillary_api_value_count":
+                merged[key] = (merged.get(key, 0) or 0) + (value or 0)
+            else:
+                merged[key] = value
+    if value_sets:
+        merged["mapillary_api_values"] = ";".join(sorted({v.strip() for v in value_sets if v.strip()}))
+    if errors:
+        merged["mapillary_api_errors"] = "; ".join(errors)
+    return merged
 
 
 def parse_street_image_link(value):
@@ -375,6 +281,7 @@ def mapillary_image_metadata_rows(
     lat: float,
     radius_m: int = 100,
     max_images: int | None = None,
+    include_thumbnails: bool = False,
 ) -> list[dict]:
     """Fetch nearby Mapillary image metadata rows for one coordinate."""
     if mly is None:
@@ -407,7 +314,7 @@ def mapillary_image_metadata_rows(
         image_id = props.get("id") or feature.get("id")
 
         thumbnail_url = pd.NA
-        if image_id:
+        if include_thumbnails and image_id:
             try:
                 thumbnail_url = mly.image_thumbnail(image_id=image_id, resolution=1024)
             except Exception:
@@ -443,8 +350,18 @@ def build_mapillary_vru_evidence_cache(
     top_n: int = 50,
     radius_m: int = 100,
     max_images_per_segment: int | None = None,
+    include_thumbnails: bool = False,
+    use_mapillary_api_filters: bool = True,
+    use_image_detections: bool = False,
+    max_detection_images_per_segment: int | None = 1,
+    overwrite: bool = False,
+    batch_size: int | None = None,
+    flush_every: int = 25,
+    progress_every: int = 25,
+    skip_missing_coords: bool = True,
+    max_workers: int = 1,
 ) -> pd.DataFrame:
-    """Create a per-image cache CSV with Mapillary metadata plus blank review-label columns."""
+    """Create a per-image cache CSV with Mapillary metadata plus VRU signal columns."""
     if df.empty:
         return pd.DataFrame()
     if "OBJECTID" not in df.columns:
@@ -454,9 +371,38 @@ def build_mapillary_vru_evidence_cache(
         df = add_street_image_query_points(df)
 
     ranked = df.sort_values("priority_score", ascending=False).head(top_n) if "priority_score" in df.columns else df.head(top_n)
-    rows = []
+    if skip_missing_coords:
+        ranked = ranked[ranked["query_lon"].notna() & ranked["query_lat"].notna()]
 
-    for _, row in ranked.iterrows():
+    existing_cache = pd.DataFrame()
+    processed_ids = set()
+    if evidence_path.exists() and not overwrite:
+        existing_cache = pd.read_csv(evidence_path)
+        if skip_missing_coords and {"query_lon", "query_lat"}.issubset(existing_cache.columns):
+            existing_cache = existing_cache[existing_cache["query_lon"].notna() & existing_cache["query_lat"].notna()]
+        required_cache_cols = [c for c in MAPILLARY_EVIDENCE_COLUMNS if c not in VRU_REVIEW_COLUMNS]
+        if all(c in existing_cache.columns for c in required_cache_cols):
+            complete_mask = existing_cache["mapillary_has_coverage"].notna()
+            if "mapillary_api_value_count" in existing_cache.columns:
+                complete_mask = complete_mask & existing_cache["mapillary_api_value_count"].notna()
+            existing_cache = existing_cache[complete_mask]
+        else:
+            existing_cache = pd.DataFrame()
+        if "OBJECTID" in existing_cache.columns:
+            processed_ids = set(existing_cache["OBJECTID"].dropna().astype(str))
+
+    if processed_ids:
+        ranked = ranked[~ranked["OBJECTID"].astype(str).isin(processed_ids)]
+    if batch_size is not None:
+        ranked = ranked.head(batch_size)
+
+    total_segments = len(ranked)
+    if total_segments == 0:
+        existing_cache.to_csv(evidence_path, index=False)
+        print("Mapillary evidence progress: no new coordinate-eligible segment(s) to process")
+        return existing_cache
+
+    def process_segment(row) -> list[dict]:
         query_lon = row.get("query_lon")
         query_lat = row.get("query_lat")
         base = {
@@ -469,7 +415,6 @@ def build_mapillary_vru_evidence_cache(
             "query_lat": query_lat,
         }
 
-        image_rows = []
         if pd.notna(query_lon) and pd.notna(query_lat):
             try:
                 image_rows = mapillary_image_metadata_rows(
@@ -478,6 +423,7 @@ def build_mapillary_vru_evidence_cache(
                     query_lat,
                     radius_m=radius_m,
                     max_images=max_images_per_segment,
+                    include_thumbnails=include_thumbnails,
                 )
             except Exception as exc:
                 image_rows = [{"mapillary_has_coverage": 0, "mapillary_image_count": 0, "mapillary_error": str(exc)}]
@@ -490,19 +436,93 @@ def build_mapillary_vru_evidence_cache(
                 }
             ]
 
+        feature_context = (
+            mapillary_feature_context(mly, query_lon, query_lat, radius_m=radius_m)
+            if use_mapillary_api_filters and pd.notna(query_lon) and pd.notna(query_lat)
+            else {}
+        )
+        segment_rows = []
         for image_row in image_rows:
-            evidence_row = {**base, **image_row}
+            image_rank = image_row.get("mapillary_image_rank")
+            within_detection_limit = (
+                max_detection_images_per_segment is None
+                or pd.isna(image_rank)
+                or int(image_rank) <= max_detection_images_per_segment
+            )
+            detection_context = (
+                mapillary_detection_context_for_image(mly, image_row.get("mapillary_image_id"))
+                if use_image_detections
+                and image_row.get("mapillary_has_coverage")
+                and within_detection_limit
+                else {}
+            )
+            context = merge_mapillary_contexts(feature_context, detection_context)
+            evidence_row = {**base, **image_row, **context}
             for col in VRU_REVIEW_COLUMNS:
                 evidence_row.setdefault(col, pd.NA)
-            rows.append(evidence_row)
+            segment_rows.append(evidence_row)
+        return segment_rows
 
-    cache = pd.DataFrame(rows)
+    rows = []
+
+    def flush_rows() -> None:
+        nonlocal existing_cache, rows
+        if not rows:
+            return
+        partial = pd.DataFrame(rows)
+        cache = pd.concat([existing_cache, partial], ignore_index=True) if not existing_cache.empty else partial
+        cache.to_csv(evidence_path, index=False)
+        existing_cache = cache
+        rows = []
+
+    max_workers = max(1, int(max_workers or 1))
+    if max_workers == 1:
+        for processed_count, (_, row) in enumerate(ranked.iterrows(), start=1):
+            rows.extend(process_segment(row))
+
+            if progress_every and (processed_count == 1 or processed_count % progress_every == 0 or processed_count == total_segments):
+                print(f"Mapillary evidence progress: {processed_count}/{total_segments} new segment(s)")
+
+            if flush_every and rows and (processed_count % flush_every == 0 or processed_count == total_segments):
+                flush_rows()
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_segment, row): row for _, row in ranked.iterrows()}
+            for processed_count, future in enumerate(as_completed(futures), start=1):
+                row = futures[future]
+                try:
+                    rows.extend(future.result())
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "OBJECTID": row.get("OBJECTID"),
+                            "english_ro": row.get("english_ro"),
+                            "RoadClass": row.get("RoadClass"),
+                            "LandUse": row.get("LandUse"),
+                            "priority_score": row.get("priority_score"),
+                            "query_lon": row.get("query_lon"),
+                            "query_lat": row.get("query_lat"),
+                            "mapillary_has_coverage": 0,
+                            "mapillary_image_count": 0,
+                            "mapillary_error": str(exc),
+                        }
+                    )
+
+                if progress_every and (
+                    processed_count == 1 or processed_count % progress_every == 0 or processed_count == total_segments
+                ):
+                    print(f"Mapillary evidence progress: {processed_count}/{total_segments} new segment(s)")
+
+                if flush_every and rows and (processed_count % flush_every == 0 or processed_count == total_segments):
+                    flush_rows()
+
+    cache = existing_cache if not rows else pd.concat([existing_cache, pd.DataFrame(rows)], ignore_index=True)
     cache.to_csv(evidence_path, index=False)
     return cache
 
 
 def vru_label_to_number(value):
-    """Normalize manual/CV review labels into 1, 0, or missing."""
+    """Normalize Mapillary/manual review labels into 1, 0, or missing."""
     if pd.isna(value):
         return pd.NA
 
@@ -594,7 +614,7 @@ def aggregate_vru_evidence_by_segment(evidence: pd.DataFrame) -> pd.DataFrame:
             if col in group.columns:
                 row[col] = pd.to_numeric(group[col], errors="coerce").max(skipna=True)
 
-        for col in ["mapillary_thumbnail_url", "local_image_path", "notes"]:
+        for col in ["mapillary_thumbnail_url", "notes", "mapillary_api_errors"]:
             if col in group.columns:
                 values = group[col].dropna()
                 row[col] = values.iloc[0] if not values.empty else pd.NA
@@ -604,13 +624,13 @@ def aggregate_vru_evidence_by_segment(evidence: pd.DataFrame) -> pd.DataFrame:
             row["mapillary_image_ids"] = ";".join(ids)
             row["mapillary_image_id"] = ids[0] if ids else pd.NA
 
-        if "cv_detected_labels" in group.columns:
+        if "mapillary_api_values" in group.columns:
             labels = set()
-            for value in group["cv_detected_labels"].dropna():
+            for value in group["mapillary_api_values"].dropna():
                 labels.update(label.strip() for label in str(value).split(";") if label.strip())
-            row["cv_detected_labels"] = ";".join(sorted(labels))
-        if "cv_detection_count" in group.columns:
-            row["cv_detection_count"] = pd.to_numeric(group["cv_detection_count"], errors="coerce").fillna(0).sum()
+            row["mapillary_api_values"] = ";".join(sorted(labels))
+        if "mapillary_api_value_count" in group.columns:
+            row["mapillary_api_value_count"] = pd.to_numeric(group["mapillary_api_value_count"], errors="coerce").fillna(0).sum()
 
         rows.append(row)
 
@@ -678,9 +698,9 @@ def build_segment_vru_check(
             "mapillary_thumbnail_url",
             *signal_columns,
             "speed_sign_visible",
-            "local_image_path",
-            "cv_detected_labels",
-            "cv_detection_count",
+            "mapillary_api_values",
+            "mapillary_api_value_count",
+            "mapillary_api_errors",
             "notes",
         ]
         if c in evidence.columns
@@ -705,7 +725,7 @@ def build_segment_vru_check(
     coverage = coverage_source.fillna(0).astype(float).gt(0)
 
     check["vru_presence_status"] = "unknown_no_mapillary_coverage"
-    check.loc[coverage & ~check["vru_reviewed"], "vru_presence_status"] = "needs_manual_or_cv_review"
+    check.loc[coverage & ~check["vru_reviewed"], "vru_presence_status"] = "needs_mapillary_or_manual_review"
     check.loc[coverage & check["vru_reviewed"] & ~check["vru_detected"], "vru_presence_status"] = (
         "reviewed_no_vru_visible"
     )
@@ -713,7 +733,7 @@ def build_segment_vru_check(
 
     check["vru_check_action"] = check["vru_presence_status"].map(
         {
-            "needs_manual_or_cv_review": "Open thumbnail/mapillary_image_id and label VRU evidence columns.",
+            "needs_mapillary_or_manual_review": "Review Mapillary API values or label VRU evidence columns manually.",
             "reviewed_no_vru_visible": "Keep as no visible VRU unless better imagery is available.",
             "vru_visible": "Use as positive VRU evidence for this segment.",
             "unknown_no_mapillary_coverage": "Try another image source or field/POI evidence.",
