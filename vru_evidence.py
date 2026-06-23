@@ -398,8 +398,8 @@ def build_mapillary_vru_evidence_cache(
 
     total_segments = len(ranked)
     if total_segments == 0:
-        existing_cache.to_csv(evidence_path, index=False)
-        print("Mapillary evidence progress: no new coordinate-eligible segment(s) to process")
+        if progress_every:
+            print("Mapillary evidence progress: no new coordinate-eligible segment(s) to process")
         return existing_cache
 
     def process_segment(row) -> list[dict]:
@@ -469,6 +469,7 @@ def build_mapillary_vru_evidence_cache(
         nonlocal existing_cache, rows
         if not rows:
             return
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
         partial = pd.DataFrame(rows)
         cache = pd.concat([existing_cache, partial], ignore_index=True) if not existing_cache.empty else partial
         cache.to_csv(evidence_path, index=False)
@@ -517,6 +518,7 @@ def build_mapillary_vru_evidence_cache(
                     flush_rows()
 
     cache = existing_cache if not rows else pd.concat([existing_cache, pd.DataFrame(rows)], ignore_index=True)
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
     cache.to_csv(evidence_path, index=False)
     return cache
 
